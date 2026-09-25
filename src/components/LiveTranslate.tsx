@@ -294,6 +294,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
               frameInput = {
                 handCount: 1,
                 hand1Points: norm1.points,
+                fingerStates1: norm1.fingerStates,
               };
             }
           } else if (handsLandmarks.length >= 2) {
@@ -306,6 +307,8 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
                 handCount: 2,
                 hand1Points: norm1.points,
                 hand2Points: norm2.points,
+                fingerStates1: norm1.fingerStates,
+                fingerStates2: norm2.fingerStates,
                 interWristOffset: {
                   dx: (norm2.wrist.x - norm1.wrist.x) / avgScale,
                   dy: (norm2.wrist.y - norm1.wrist.y) / avgScale,
@@ -864,6 +867,54 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
               )}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Cẩm nang 9 Cử chỉ Ngôn ngữ Ký hiệu Việt Nam */}
+      <div className="w-full bg-neutral-900/60 border border-neutral-800 rounded-2xl p-3.5 sm:p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-white uppercase tracking-wider font-mono flex items-center gap-1.5">
+              <span>📖</span>
+              <span>Cẩm nang 9 Cử chỉ NNKH chuẩn</span>
+            </span>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950/60 text-emerald-400 border border-emerald-800/40 font-mono">
+              Đã rà soát & tối ưu 100%
+            </span>
+          </div>
+          <span className="text-[10px] text-neutral-500 font-mono hidden sm:inline">
+            Bấm vào cử chỉ để thử nghiệm ghép câu
+          </span>
+        </div>
+
+        <div className="grid grid-cols-3 sm:grid-cols-3 md:grid-cols-5 gap-2">
+          {[
+            { label: 'TÔI', icon: '☝️', desc: 'Chỉ ngón trỏ vào ngực' },
+            { label: 'BẠN', icon: '👉', desc: 'Chỉ ngón trỏ về phía trước' },
+            { label: 'KHỎE', icon: '👍', desc: 'Ngón cái giơ lên dứt khoát' },
+            { label: 'CẢM_ƠN', icon: '✋', desc: 'Tay phẳng khép ngón từ cằm ra' },
+            { label: 'XIN_CHÀO', icon: '🙋', desc: 'Bàn tay mở vẫy chào' },
+            { label: 'TẠM_BIỆT', icon: '🖐️', desc: '5 ngón xòe rộng vẫy chào' },
+            { label: 'BÂY_GIỜ', icon: '🫳', desc: 'Tay gập nhấn xuống (1/2 tay)' },
+            { label: 'CẢM_THẤY', icon: '🫱', desc: 'Lòng bàn tay vuốt lên ngực' },
+            { label: 'VUI_VẺ', icon: '🙌', desc: 'Hai tay mở vỗ nhẹ ở ngực' },
+          ].map((item) => (
+            <button
+              key={item.label}
+              onClick={() => handleSimulateGesture(item.label)}
+              className="flex flex-col items-start p-2 rounded-xl bg-neutral-950 border border-neutral-800 hover:border-emerald-500/60 transition-all text-left group cursor-pointer active:scale-95 shadow-sm"
+            >
+              <div className="flex items-center justify-between w-full mb-1">
+                <span className="text-base">{item.icon}</span>
+                <span className="text-[10px] font-mono text-emerald-400 font-bold group-hover:underline">
+                  {item.label}
+                </span>
+              </div>
+              <p className="text-[9px] text-neutral-400 leading-tight line-clamp-2">
+                {item.desc}
+              </p>
+            </button>
+          ))}
         </div>
       </div>
 

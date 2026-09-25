@@ -3,6 +3,7 @@ import {
   computeHandVectorDistance,
   computeCosineSimilarity,
   distanceToSimilarity,
+  FingerStates,
 } from './handNormalization';
 
 export const CONFIDENCE_THRESHOLD = 0.52; // 52% default for fast & accessible recognition
@@ -12,6 +13,8 @@ export interface FrameInputData {
   handCount: number; // 0, 1, or 2
   hand1Points?: number[]; // 63 values
   hand2Points?: number[]; // 63 values
+  fingerStates1?: FingerStates;
+  fingerStates2?: FingerStates;
   interWristOffset?: { dx: number; dy: number; dz: number };
 }
 
@@ -28,59 +31,107 @@ function flipHandX(points: number[]): number[] {
 }
 
 /**
- * Calculates similarity between a current observed frame and a stored sign sample.
- * Evaluates both direct and horizontally mirrored hand for 1-hand gestures
- * so both left-handed and right-handed signers get instant high confidence.
+ * Computes single hand similarity evaluating both direct and mirrored orientation.
+ */
+function matchSingleHand(observed: number[], template: number[]): number {
+  const distDirect = computeHandVectorDistance(observed, template);
+  const cosDirect = computeCosineSimilarity(observed, template);
+  const simDirect = 0.55 * distanceToSimilarity(distDirect) + 0.45 * Math.max(0, cosDirect);
+
+  const flipped = flipHandX(observed);
+  const distFlipped = computeHandVectorDistance(flipped, template);
+  const cosFlipped = computeCosineSimilarity(flipped, template);
+  const simFlipped = 0.55 * distanceToSimilarity(distFlipped) + 0.45 * Math.max(0, cosFlipped);
+
+  return Math.max(simDirect, simFlipped);
+}
+
+/**
+ * Calculates similarity between observed frame and a stored sign sample.
+ * Combines 63D landmark distance with anatomical finger state constraints.
  */
 export function computeSampleSimilarity(frame: FrameInputData, sample: SignSample): number {
-  if (frame.handCount !== sample.handCount) {
+  if (frame.handCount === 0 || !frame.hand1Points || !sample.hand1) {
     return 0;
   }
 
-  if (frame.handCount === 1) {
-    if (!frame.hand1Points || !sample.hand1) return 0;
+  let baseSimilarity = 0;
 
-    // Test direct orientation
-    const distDirect = computeHandVectorDistance(frame.hand1Points, sample.hand1);
-    const cosDirect = computeCosineSimilarity(frame.hand1Points, sample.hand1);
-    const simDirect = 0.60 * distanceToSimilarity(distDirect) + 0.40 * Math.max(0, cosDirect);
+  if (frame.handCount === 1 && sample.handCount === 1) {
+    baseSimilarity = matchSingleHand(frame.hand1Points, sample.hand1);
+  } else if (frame.handCount === 2 && sample.handCount === 2) {
+    if (!frame.hand2Points || !sample.hand2) return 0;
+    // Test both direct and swapped
+    const simDirect1 = matchSingleHand(frame.hand1Points, sample.hand1);
+    const simDirect2 = matchSingleHand(frame.hand2Points, sample.hand2);
+    const scoreDirect = (simDirect1 + simDirect2) / 2;
 
-    // Test mirrored (left vs right hand) orientation
-    const flippedPoints = flipHandX(frame.hand1Points);
-    const distFlipped = computeHandVectorDistance(flippedPoints, sample.hand1);
-    const cosFlipped = computeCosineSimilarity(flippedPoints, sample.hand1);
-    const simFlipped = 0.60 * distanceToSimilarity(distFlipped) + 0.40 * Math.max(0, cosFlipped);
+    const simSwapped1 = matchSingleHand(frame.hand1Points, sample.hand2);
+    const simSwapped2 = matchSingleHand(frame.hand2Points, sample.hand1);
+    const scoreSwapped = (simSwapped1 + simSwapped2) / 2;
 
-    return Math.max(0, Math.min(1, Math.max(simDirect, simFlipped)));
+    baseSimilarity = Math.max(scoreDirect, scoreSwapped);
+  } else if (frame.handCount === 1 && sample.handCount === 2) {
+    // Graceful single-hand signing for 2-handed gestures (like BÂY_GIỜ, VUI_VẺ)
+    const match1 = matchSingleHand(frame.hand1Points, sample.hand1);
+    const match2 = sample.hand2 ? matchSingleHand(frame.hand1Points, sample.hand2) : 0;
+    baseSimilarity = Math.max(match1, match2) * 0.90;
+  } else if (frame.handCount === 2 && sample.handCount === 1) {
+    // User raised 2 hands for a 1-hand sign; match dominant hand
+    const match1 = matchSingleHand(frame.hand1Points, sample.hand1);
+    const match2 = frame.hand2Points ? matchSingleHand(frame.hand2Points, sample.hand1) : 0;
+    baseSimilarity = Math.max(match1, match2) * 0.92;
   }
 
-  if (frame.handCount === 2) {
-    if (!frame.hand1Points || !frame.hand2Points || !sample.hand1 || !sample.hand2) return 0;
+  // Apply anatomical finger state heuristics if available
+  const f1 = frame.fingerStates1;
+  if (f1) {
+    const isThumbsUp = f1.thumbUp || (f1.thumb > 0.7 && f1.index < 0.35 && f1.middle < 0.35 && f1.ring < 0.35 && f1.pinky < 0.35);
+    const isSingleFingerPoint = f1.index > 0.65 && f1.middle < 0.35 && f1.ring < 0.35 && f1.pinky < 0.35;
+    const isAllFingersOpen = f1.index > 0.65 && f1.middle > 0.65 && f1.ring > 0.65 && f1.pinky > 0.65;
+    const isFlatPalmTight = isAllFingersOpen && f1.spread < 0.28;
+    const isSpreadWide = isAllFingersOpen && f1.spread >= 0.28;
 
-    // Direct orientation (h1->s1, h2->s2)
-    const dist1 = computeHandVectorDistance(frame.hand1Points, sample.hand1);
-    const dist2 = computeHandVectorDistance(frame.hand2Points, sample.hand2);
-    const scoreDirect = (distanceToSimilarity(dist1) + distanceToSimilarity(dist2)) / 2;
+    // 1. KHỎE: Only thumb extended, all other fingers closed into a fist
+    if (isThumbsUp) {
+      if (sample.label === 'KHỎE') {
+        baseSimilarity = Math.max(baseSimilarity, 0.88) * 1.15;
+      } else {
+        baseSimilarity *= 0.15; // Suppress open-hand false positives like TẠM_BIỆT
+      }
+    }
 
-    // Swapped orientation (h1->s2, h2->s1)
-    const distSwapped1 = computeHandVectorDistance(frame.hand1Points, sample.hand2);
-    const distSwapped2 = computeHandVectorDistance(frame.hand2Points, sample.hand1);
-    const scoreSwapped = (distanceToSimilarity(distSwapped1) + distanceToSimilarity(distSwapped2)) / 2;
+    // 2. BẠN / TÔI: Single index finger pointing
+    if (isSingleFingerPoint) {
+      if (sample.label === 'BẠN' || sample.label === 'TÔI') {
+        baseSimilarity = Math.max(baseSimilarity, 0.86) * 1.12;
+      } else {
+        baseSimilarity *= 0.15; // Suppress other gestures
+      }
+    }
 
-    return Math.max(scoreDirect, scoreSwapped);
+    // 3. CẢM_ƠN: Fingers flat together
+    if (isFlatPalmTight) {
+      if (sample.label === 'CẢM_ƠN') {
+        baseSimilarity = Math.max(baseSimilarity, 0.86) * 1.10;
+      }
+    }
+
+    // 4. TẠM_BIỆT vs XIN_CHÀO: Open fingers spread
+    if (isSpreadWide) {
+      if (sample.label === 'TẠM_BIỆT' || sample.label === 'XIN_CHÀO') {
+        baseSimilarity = Math.max(baseSimilarity, 0.85);
+      } else if (sample.label === 'KHỎE' || sample.label === 'BẠN' || sample.label === 'TÔI') {
+        baseSimilarity *= 0.20; // An open hand cannot be a thumbs-up or point
+      }
+    }
   }
 
-  return 0;
+  return Math.max(0, Math.min(1, baseSimilarity));
 }
 
 /**
  * Classifies an incoming frame of hand landmarks against the active dataset using k-NN.
- *
- * @param frame Observed hand landmarks in current video frame
- * @param dataset The full or profile-filtered list of SignSamples
- * @param activeProfile 'global' for Global Model, or profile name (e.g. 'khang')
- * @param k Number of nearest neighbors to aggregate (default 3)
- * @param threshold Confidence threshold to consider confident
  */
 export function classifyHandGesture(
   frame: FrameInputData,
@@ -152,7 +203,7 @@ export function classifyHandGesture(
   for (const [lbl, stat] of Object.entries(classScores)) {
     const avgSim = stat.totalSim / stat.count;
     // Blend average similarity with top-1 similarity for stability
-    const blended = avgSim * 0.7 + stat.maxSim * 0.3;
+    const blended = avgSim * 0.65 + stat.maxSim * 0.35;
     if (blended > bestConfidence) {
       bestConfidence = blended;
       bestLabel = lbl;
