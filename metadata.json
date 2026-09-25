@@ -1,0 +1,11 @@
+{
+  "name": "Voice2Hand — Sign Language Communication",
+  "description": "Công cụ dịch ngôn ngữ ký hiệu Việt Nam (NNKH) sang văn bản tiếng Việt theo thời gian thực từ camera, sử dụng nhận diện landmark bàn tay và mô hình k-NN cục bộ.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
