@@ -5,12 +5,13 @@ import {
   Sparkles,
   Camera,
   AlertTriangle,
-  RotateCcw,
   CheckCircle2,
   Users,
-  Eye,
   Info,
   Layers,
+  Zap,
+  Sliders,
+  X,
 } from 'lucide-react';
 import { SignSample, RecognitionResult, Landmark } from '../types';
 import {
@@ -22,10 +23,13 @@ import {
 } from '../utils/handNormalization';
 import {
   classifyHandGesture,
-  CONFIDENCE_THRESHOLD,
   FrameInputData,
 } from '../utils/knnClassifier';
-import { SentenceAggregator } from '../utils/sentenceBuilder';
+import {
+  SentenceAggregator,
+  AggregatorConfig,
+  DEFAULT_AGGREGATOR_CONFIG,
+} from '../utils/sentenceBuilder';
 import { speakVietnamese } from '../utils/speech';
 
 interface LiveTranslateProps {
@@ -33,6 +37,51 @@ interface LiveTranslateProps {
   activeProfile: string;
   onProfileChange: (profile: string) => void;
   availableProfiles: string[];
+}
+
+type SensitivityPreset = 'fast' | 'balanced' | 'precise';
+
+const PRESETS: Record<SensitivityPreset, AggregatorConfig> = {
+  fast: {
+    stabilityFrames: 3,         // ~90-120ms lock time
+    cooldownMs: 320,            // Fast 320ms transition
+    restFramesRequired: 2,
+    confidenceThreshold: 0.48,  // Very responsive
+  },
+  balanced: {
+    stabilityFrames: 4,         // ~140-160ms lock time
+    cooldownMs: 420,            // 420ms transition
+    restFramesRequired: 2,
+    confidenceThreshold: 0.52,  // Default balanced
+  },
+  precise: {
+    stabilityFrames: 6,         // ~220ms lock time
+    cooldownMs: 650,            // 650ms transition
+    restFramesRequired: 3,
+    confidenceThreshold: 0.60,  // Higher threshold
+  },
+};
+
+/**
+ * Plays a short, soft audio cue when a gesture is recognized and committed.
+ */
+function playCommitSound() {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(659.25, ctx.currentTime); // E5
+    osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.08); // A5
+    gain.gain.setValueAtTime(0.12, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.12);
+  } catch {
+    // AudioContext not allowed or not supported; ignore silently
+  }
 }
 
 export const LiveTranslate: React.FC<LiveTranslateProps> = ({
@@ -45,11 +94,18 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameIdRef = useRef<number | null>(null);
+  const landmarkerInstanceRef = useRef<any>(null);
+  const lastProcessTimeRef = useRef<number>(0);
 
   // Camera & Model state
   const [cameraActive, setCameraActive] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [modelLoading, setModelLoading] = useState<boolean>(true);
+
+  // Sensitivity Settings State
+  const [currentPreset, setCurrentPreset] = useState<SensitivityPreset>('balanced');
+  const [sensitivityConfig, setSensitivityConfig] = useState<AggregatorConfig>(PRESETS.balanced);
+  const [showSensitivityPanel, setShowSensitivityPanel] = useState<boolean>(false);
 
   // Recognition state
   const [recognitionResult, setRecognitionResult] = useState<RecognitionResult>({
@@ -63,6 +119,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
 
   // Sentence state
   const [sentenceTokens, setSentenceTokens] = useState<string[]>([]);
+  const [recentCommitBadge, setRecentCommitBadge] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [gestureProgress, setGestureProgress] = useState<number>(0);
   const [isCoolingDown, setIsCoolingDown] = useState<boolean>(false);
@@ -74,7 +131,9 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
   const [smoothingError, setSmoothingError] = useState<string | null>(null);
 
   // Temporal aggregator ref
-  const aggregatorRef = useRef<SentenceAggregator>(new SentenceAggregator());
+  const aggregatorRef = useRef<SentenceAggregator>(
+    new SentenceAggregator(PRESETS.balanced)
+  );
 
   // Distinct labels in current pool
   const activePool =
@@ -88,7 +147,16 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 2400);
+    }, 2200);
+  };
+
+  // Change sensitivity preset
+  const handleSelectPreset = (preset: SensitivityPreset) => {
+    setCurrentPreset(preset);
+    const newConfig = PRESETS[preset];
+    setSensitivityConfig(newConfig);
+    aggregatorRef.current.updateConfig(newConfig);
+    showToast(`Độ nhạy: ${preset === 'fast' ? 'Siêu nhanh' : preset === 'balanced' ? 'Tiêu chuẩn' : 'Chính xác'}`);
   };
 
   // Start Camera
@@ -150,6 +218,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
       .then((landmarker) => {
         if (!mounted) return;
         if (landmarker) {
+          landmarkerInstanceRef.current = landmarker;
           setModelLoading(false);
           startCamera();
         } else {
@@ -173,94 +242,105 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
     };
   }, [startCamera, stopCamera]);
 
-  // Main Detection Loop
+  // Main Detection Loop (Optimized for smooth, low-latency execution)
   useEffect(() => {
     let isRunning = true;
+    const TARGET_INTERVAL_MS = 32; // ~30 FPS: optimal for low-latency & no thermal throttling on mobile
 
-    async function processVideoFrame() {
+    function processVideoFrame(now: number) {
       if (!isRunning) return;
 
       const video = videoRef.current;
       const canvas = canvasRef.current;
+      const landmarker = landmarkerInstanceRef.current;
+
+      // Throttle detection to ~30 FPS to avoid microtask lag and frame drops
+      const elapsed = now - lastProcessTimeRef.current;
 
       if (
+        landmarker &&
         video &&
         canvas &&
         video.readyState >= 2 &&
         !video.paused &&
-        !video.ended
+        !video.ended &&
+        elapsed >= TARGET_INTERVAL_MS
       ) {
-        const landmarker = await getHandLandmarker();
+        lastProcessTimeRef.current = now;
 
-        if (landmarker) {
-          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-            canvas.width = video.videoWidth || 640;
-            canvas.height = video.videoHeight || 480;
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 480;
+        }
+
+        const ctx = canvas.getContext('2d');
+        const timestamp = performance.now();
+
+        try {
+          const results = landmarker.detectForVideo(video, timestamp);
+          const handsLandmarks = (results.landmarks as Landmark[][]) || [];
+
+          // Draw overlay landmarks on canvas
+          if (ctx) {
+            drawLandmarksOnCanvas(ctx, handsLandmarks, canvas.width, canvas.height, true);
           }
 
-          const ctx = canvas.getContext('2d');
-          const timestamp = performance.now();
+          // Extract normalized feature vectors
+          let frameInput: FrameInputData = { handCount: 0 };
 
-          try {
-            const results = landmarker.detectForVideo(video, timestamp);
-            const handsLandmarks = (results.landmarks as Landmark[][]) || [];
-
-            // Draw overlay landmarks on canvas
-            if (ctx) {
-              drawLandmarksOnCanvas(ctx, handsLandmarks, canvas.width, canvas.height, true);
+          if (handsLandmarks.length === 1) {
+            const norm1 = normalizeHandLandmarks(handsLandmarks[0]);
+            if (norm1) {
+              frameInput = {
+                handCount: 1,
+                hand1Points: norm1.points,
+              };
             }
-
-            // Extract normalized feature vectors
-            let frameInput: FrameInputData = { handCount: 0 };
-
-            if (handsLandmarks.length === 1) {
-              const norm1 = normalizeHandLandmarks(handsLandmarks[0]);
-              if (norm1) {
-                frameInput = {
-                  handCount: 1,
-                  hand1Points: norm1.points,
-                };
-              }
-            } else if (handsLandmarks.length >= 2) {
-              // Up to 2 hands
-              const norm1 = normalizeHandLandmarks(handsLandmarks[0]);
-              const norm2 = normalizeHandLandmarks(handsLandmarks[1]);
-              if (norm1 && norm2) {
-                const avgScale = (norm1.scale + norm2.scale) / 2 || 1;
-                frameInput = {
-                  handCount: 2,
-                  hand1Points: norm1.points,
-                  hand2Points: norm2.points,
-                  interWristOffset: {
-                    dx: (norm2.wrist.x - norm1.wrist.x) / avgScale,
-                    dy: (norm2.wrist.y - norm1.wrist.y) / avgScale,
-                    dz: ((norm2.wrist.z ?? 0) - (norm1.wrist.z ?? 0)) / avgScale,
-                  },
-                };
-              }
+          } else if (handsLandmarks.length >= 2) {
+            // Up to 2 hands
+            const norm1 = normalizeHandLandmarks(handsLandmarks[0]);
+            const norm2 = normalizeHandLandmarks(handsLandmarks[1]);
+            if (norm1 && norm2) {
+              const avgScale = (norm1.scale + norm2.scale) / 2 || 1;
+              frameInput = {
+                handCount: 2,
+                hand1Points: norm1.points,
+                hand2Points: norm2.points,
+                interWristOffset: {
+                  dx: (norm2.wrist.x - norm1.wrist.x) / avgScale,
+                  dy: (norm2.wrist.y - norm1.wrist.y) / avgScale,
+                  dz: ((norm2.wrist.z ?? 0) - (norm1.wrist.z ?? 0)) / avgScale,
+                },
+              };
             }
-
-            // Classify with k-NN
-            const recognition = classifyHandGesture(frameInput, dataset, activeProfile);
-            setRecognitionResult(recognition);
-
-            // Temporal Segmentation & Sentence building
-            const { committedToken, progress, isCoolingDown: cooldown } =
-              aggregatorRef.current.processFrame(recognition);
-
-            setGestureProgress(progress);
-            setIsCoolingDown(cooldown);
-
-            if (committedToken) {
-              setSentenceTokens((prev) => {
-                const next = [...prev, committedToken];
-                return next;
-              });
-              showToast(`Đã nhận diện: ${committedToken}`);
-            }
-          } catch (detErr) {
-            console.error('Detection frame error:', detErr);
           }
+
+          // Classify with k-NN using current sensitivity threshold
+          const recognition = classifyHandGesture(
+            frameInput,
+            dataset,
+            activeProfile,
+            3,
+            sensitivityConfig.confidenceThreshold
+          );
+          setRecognitionResult(recognition);
+
+          // Temporal Segmentation & Sentence building
+          const { committedToken, progress, isCoolingDown: cooldown } =
+            aggregatorRef.current.processFrame(recognition);
+
+          setGestureProgress(progress);
+          setIsCoolingDown(cooldown);
+
+          if (committedToken) {
+            playCommitSound();
+            setRecentCommitBadge(committedToken);
+            setTimeout(() => setRecentCommitBadge(null), 1800);
+
+            setSentenceTokens((prev) => [...prev, committedToken]);
+          }
+        } catch (detErr) {
+          console.error('Detection frame error:', detErr);
         }
       }
 
@@ -277,7 +357,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
         cancelAnimationFrame(animFrameIdRef.current);
       }
     };
-  }, [dataset, activeProfile]);
+  }, [dataset, activeProfile, sensitivityConfig]);
 
   // Clear Sentence
   const handleClearSentence = () => {
@@ -286,6 +366,11 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
     setSmoothingError(null);
     aggregatorRef.current.reset();
     showToast('Đã xoá câu');
+  };
+
+  // Remove a single token
+  const handleRemoveToken = (indexToRemove: number) => {
+    setSentenceTokens((prev) => prev.filter((_, idx) => idx !== indexToRemove));
   };
 
   // Text to Speech
@@ -321,7 +406,6 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
       }
     } catch (err: any) {
       console.error('Error smoothing sentence:', err);
-      // Client fallback: basic capitalization and spaces
       const fallback = sentenceTokens
         .map((t) => t.replace(/_/g, ' ').toLowerCase())
         .join(' ');
@@ -333,54 +417,53 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
     }
   };
 
-  // Quick gesture simulator (allows testing the temporal segmentation without webcam)
+  // Quick gesture simulator
   const handleSimulateGesture = (label: string) => {
     const simulatedRecognition: RecognitionResult = {
       label,
-      confidence: 0.94,
+      confidence: 0.95,
       handCount: ['BÂY_GIỜ', 'VUI_VẺ'].includes(label) ? 2 : 1,
       isConfident: true,
-      statusText: `✓ ${label} · confidence 94%`,
-      topMatches: [{ label, score: 0.94 }],
+      statusText: `✓ ${label} · confidence 95%`,
+      topMatches: [{ label, score: 0.95 }],
     };
 
     setRecognitionResult(simulatedRecognition);
 
-    // Simulate 8 consecutive frames to satisfy temporal segmentation rule
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < sensitivityConfig.stabilityFrames; i++) {
       const { committedToken } = aggregatorRef.current.processFrame(simulatedRecognition);
       if (committedToken) {
+        playCommitSound();
+        setRecentCommitBadge(committedToken);
+        setTimeout(() => setRecentCommitBadge(null), 1800);
         setSentenceTokens((prev) => [...prev, committedToken]);
-        showToast(`Đã nhận diện: ${committedToken}`);
         break;
       }
     }
   };
 
-  const rawSentenceString = sentenceTokens.join(' ');
-
   return (
-    <div className="flex flex-col items-center w-full max-w-4xl mx-auto px-4 py-4 space-y-4">
-      {/* Toast Notification */}
+    <div className="flex flex-col items-center w-full max-w-4xl mx-auto px-3 sm:px-4 py-2 sm:py-4 space-y-3 sm:space-y-4">
+      {/* Toast Notification (Floating unobtrusively at top center) */}
       {toastMessage && (
-        <div className="fixed top-16 right-4 z-50 bg-neutral-900 border border-emerald-500/40 text-emerald-400 px-4 py-2 rounded-lg shadow-xl text-xs font-mono flex items-center gap-2 animate-bounce">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 bg-neutral-900/95 border border-emerald-500/50 text-emerald-400 px-4 py-2 rounded-full shadow-2xl text-xs font-mono flex items-center gap-2 animate-in fade-in slide-in-from-top-2 duration-150">
+          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
           <span>{toastMessage}</span>
         </div>
       )}
 
-      {/* Profile & Model Status Bar */}
-      <div className="w-full flex flex-col sm:flex-row items-center justify-between bg-neutral-900/90 border border-neutral-800 rounded-xl px-4 py-2.5 gap-2.5">
-        {/* Profile Dropdown */}
+      {/* Profile & Speed Selector Bar */}
+      <div className="w-full flex flex-col sm:flex-row items-center justify-between bg-neutral-900/90 border border-neutral-800 rounded-xl px-3 sm:px-4 py-2 gap-2 text-xs">
+        {/* Profile Selector */}
         <div className="flex items-center gap-2 w-full sm:w-auto">
           <Users className="w-4 h-4 text-neutral-400 shrink-0" />
-          <span className="text-xs text-neutral-400 font-medium">Chế độ mẫu:</span>
+          <span className="text-neutral-400 font-medium shrink-0">Mẫu:</span>
           <select
             value={activeProfile}
             onChange={(e) => onProfileChange(e.target.value)}
-            className="bg-neutral-950 border border-neutral-700 text-neutral-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-emerald-500 font-medium cursor-pointer"
+            className="flex-1 sm:flex-initial bg-neutral-950 border border-neutral-700 text-neutral-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-emerald-500 font-medium cursor-pointer"
           >
-            <option value="global">🌐 Global Model (Toàn bộ người ký)</option>
+            <option value="global">🌐 Global Model (Toàn bộ)</option>
             {availableProfiles.map((p) => (
               <option key={p} value={p}>
                 👤 Profile: {p}
@@ -389,35 +472,155 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
           </select>
         </div>
 
-        {/* Model Status Indicator */}
-        <div className="flex items-center gap-2 text-xs font-medium">
-          <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-neutral-300">
-            {activeProfile === 'global' ? (
-              <span className="text-emerald-400">
-                ✓ Global Model sẵn sàng · <strong className="text-white">{distinctLabels.length}</strong> ký hiệu
-              </span>
-            ) : (
-              <span className="text-emerald-400">
-                ✓ Profile: <strong className="text-white">{activeProfile}</strong> sẵn sàng ·{' '}
-                <strong className="text-white">{distinctLabels.length}</strong> ký hiệu
-              </span>
-            )}
-          </span>
+        {/* Speed & Sensitivity Presets Bar */}
+        <div className="flex items-center gap-1.5 w-full sm:w-auto justify-between sm:justify-end">
+          <div className="flex items-center gap-1 bg-neutral-950 p-0.5 rounded-lg border border-neutral-800">
+            <button
+              onClick={() => handleSelectPreset('fast')}
+              className={`px-2 py-1 rounded text-[11px] font-semibold transition-all cursor-pointer ${
+                currentPreset === 'fast'
+                  ? 'bg-emerald-500 text-neutral-950 font-bold shadow'
+                  : 'text-neutral-400 hover:text-white'
+              }`}
+            >
+              🚀 Nhanh
+            </button>
+            <button
+              onClick={() => handleSelectPreset('balanced')}
+              className={`px-2 py-1 rounded text-[11px] font-semibold transition-all cursor-pointer ${
+                currentPreset === 'balanced'
+                  ? 'bg-emerald-500 text-neutral-950 font-bold shadow'
+                  : 'text-neutral-400 hover:text-white'
+              }`}
+            >
+              ⚡ Chuẩn
+            </button>
+            <button
+              onClick={() => handleSelectPreset('precise')}
+              className={`px-2 py-1 rounded text-[11px] font-semibold transition-all cursor-pointer ${
+                currentPreset === 'precise'
+                  ? 'bg-emerald-500 text-neutral-950 font-bold shadow'
+                  : 'text-neutral-400 hover:text-white'
+              }`}
+            >
+              🎯 Kỹ
+            </button>
+          </div>
+
+          <button
+            onClick={() => setShowSensitivityPanel(!showSensitivityPanel)}
+            title="Tùy chỉnh thông số độ nhạy"
+            className={`p-1.5 rounded-lg border transition-colors cursor-pointer ${
+              showSensitivityPanel
+                ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
+                : 'bg-neutral-950 text-neutral-400 border-neutral-800 hover:text-white'
+            }`}
+          >
+            <Sliders className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
+
+      {/* Optional Expanded Sensitivity Slider Panel */}
+      {showSensitivityPanel && (
+        <div className="w-full bg-neutral-950 border border-neutral-800 rounded-xl p-3.5 space-y-3 text-xs animate-in fade-in duration-150">
+          <div className="flex items-center justify-between border-b border-neutral-800 pb-2">
+            <span className="font-bold text-white flex items-center gap-1.5">
+              <Zap className="w-4 h-4 text-emerald-400" />
+              Tùy chỉnh thông số nhận diện & tốc độ
+            </span>
+            <button
+              onClick={() => setShowSensitivityPanel(false)}
+              className="text-neutral-500 hover:text-white p-0.5"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {/* 1. Frames required */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-[11px] text-neutral-400">
+                <span>Số khung hình chốt:</span>
+                <strong className="text-emerald-400">{sensitivityConfig.stabilityFrames} frames (~{Math.round(sensitivityConfig.stabilityFrames * 33)}ms)</strong>
+              </div>
+              <input
+                type="range"
+                min="2"
+                max="8"
+                step="1"
+                value={sensitivityConfig.stabilityFrames}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  const updated = { ...sensitivityConfig, stabilityFrames: val };
+                  setSensitivityConfig(updated);
+                  aggregatorRef.current.updateConfig(updated);
+                }}
+                className="w-full accent-emerald-500 cursor-pointer"
+              />
+              <span className="text-[10px] text-neutral-500">Giảm để nhận diện nhanh hơn</span>
+            </div>
+
+            {/* 2. Cooldown */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-[11px] text-neutral-400">
+                <span>Thời gian hồi chiêu:</span>
+                <strong className="text-emerald-400">{sensitivityConfig.cooldownMs}ms</strong>
+              </div>
+              <input
+                type="range"
+                min="250"
+                max="900"
+                step="50"
+                value={sensitivityConfig.cooldownMs}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  const updated = { ...sensitivityConfig, cooldownMs: val };
+                  setSensitivityConfig(updated);
+                  aggregatorRef.current.updateConfig(updated);
+                }}
+                className="w-full accent-emerald-500 cursor-pointer"
+              />
+              <span className="text-[10px] text-neutral-500">Nghỉ giữa 2 ký hiệu liên tiếp</span>
+            </div>
+
+            {/* 3. Threshold */}
+            <div className="space-y-1">
+              <div className="flex justify-between text-[11px] text-neutral-400">
+                <span>Ngưỡng tin cậy (Confidence):</span>
+                <strong className="text-emerald-400">{Math.round(sensitivityConfig.confidenceThreshold * 100)}%</strong>
+              </div>
+              <input
+                type="range"
+                min="0.40"
+                max="0.75"
+                step="0.02"
+                value={sensitivityConfig.confidenceThreshold}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  const updated = { ...sensitivityConfig, confidenceThreshold: val };
+                  setSensitivityConfig(updated);
+                  aggregatorRef.current.updateConfig(updated);
+                }}
+                className="w-full accent-emerald-500 cursor-pointer"
+              />
+              <span className="text-[10px] text-neutral-500">Giảm nếu cử chỉ tay hay bị "Không chắc chắn"</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Centered Camera Container */}
       <div className="w-full max-w-2xl flex flex-col items-center">
         <div className="relative w-full aspect-[4/3] bg-neutral-950 rounded-2xl border-2 border-neutral-800 hover:border-emerald-500/40 transition-colors overflow-hidden shadow-2xl flex items-center justify-center">
           {/* Label "TRANSLATION" at top-left */}
-          <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 bg-neutral-950/80 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-800 text-[11px] font-mono tracking-wider text-emerald-400 font-bold uppercase">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+          <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 bg-neutral-950/80 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-800 text-[11px] font-mono tracking-wider text-emerald-400 font-bold uppercase select-none">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
             TRANSLATION
           </div>
 
           {/* Hand Count Indicator at top-right */}
-          <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 bg-neutral-950/80 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-800 text-[11px] font-mono text-neutral-400">
+          <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 bg-neutral-950/80 backdrop-blur-md px-2.5 py-1 rounded-md border border-neutral-800 text-[11px] font-mono text-neutral-400 select-none">
             <Layers className="w-3 h-3 text-neutral-400" />
             <span>
               {recognitionResult.handCount === 0
@@ -425,6 +628,15 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
                 : `${recognitionResult.handCount} tay`}
             </span>
           </div>
+
+          {/* Quick Commit Badge on screen */}
+          {recentCommitBadge && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
+              <div className="bg-emerald-500/90 text-neutral-950 px-5 py-2 rounded-2xl text-xl sm:text-2xl font-black font-mono tracking-wider shadow-[0_0_30px_#22c55e] animate-out zoom-out-90 duration-500">
+                ✓ {recentCommitBadge}
+              </div>
+            </div>
+          )}
 
           {/* Video Feed (mirrored for natural interaction) */}
           <video
@@ -459,7 +671,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
                   <p className="text-sm text-neutral-200 font-medium">{cameraError}</p>
                   <button
                     onClick={startCamera}
-                    className="px-4 py-2 bg-emerald-500 text-neutral-950 font-bold rounded-lg text-xs hover:bg-emerald-400 transition-colors shadow"
+                    className="px-4 py-2 bg-emerald-500 text-neutral-950 font-bold rounded-lg text-xs hover:bg-emerald-400 transition-colors shadow cursor-pointer"
                   >
                     Thử lại quyền camera
                   </button>
@@ -470,7 +682,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
                   <p className="text-sm text-neutral-400">Camera đang tạm dừng</p>
                   <button
                     onClick={startCamera}
-                    className="px-4 py-2 bg-emerald-500 text-neutral-950 font-bold rounded-lg text-xs hover:bg-emerald-400 transition-colors"
+                    className="px-4 py-2 bg-emerald-500 text-neutral-950 font-bold rounded-lg text-xs hover:bg-emerald-400 transition-colors cursor-pointer"
                   >
                     Bật Camera
                   </button>
@@ -481,9 +693,9 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
 
           {/* Temporal Confirmation Progress Bar */}
           {gestureProgress > 0 && gestureProgress < 1 && (
-            <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-neutral-900/80 z-20 overflow-hidden">
+            <div className="absolute bottom-0 left-0 right-0 h-2 bg-neutral-900/80 z-20 overflow-hidden">
               <div
-                className="h-full bg-emerald-500 transition-all duration-75"
+                className="h-full bg-emerald-500 transition-all duration-75 shadow-[0_0_10px_#22c55e]"
                 style={{ width: `${Math.round(gestureProgress * 100)}%` }}
               />
             </div>
@@ -491,13 +703,13 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
         </div>
 
         {/* Real-time Recognition Status Line */}
-        <div className="w-full mt-3 flex items-center justify-between px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-xl">
+        <div className="w-full mt-2.5 flex items-center justify-between px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-xl">
           <div className="flex items-center gap-2 text-xs sm:text-sm font-mono">
             {recognitionResult.handCount === 0 ? (
               <span className="text-neutral-500 italic">Đang chờ tay...</span>
             ) : recognitionResult.isConfident ? (
               <span className="text-emerald-400 font-bold flex items-center gap-1.5">
-                <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#22c55e]" />
+                <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_#22c55e]" />
                 {recognitionResult.statusText}
               </span>
             ) : (
@@ -508,32 +720,36 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
             )}
           </div>
 
-          {/* Cooldown or Stabilization indicator */}
+          {/* Fast status indicator */}
           <div className="text-[11px] font-mono text-neutral-400">
             {isCoolingDown ? (
-              <span className="text-neutral-500">Chờ chuyển động...</span>
+              <span className="text-neutral-500">Chuyển tiếp...</span>
             ) : gestureProgress > 0 ? (
-              <span className="text-emerald-400">Đang giữ ({Math.round(gestureProgress * 8)}/8)</span>
+              <span className="text-emerald-400 font-bold">
+                Giữ ({Math.round(gestureProgress * sensitivityConfig.stabilityFrames)}/{sensitivityConfig.stabilityFrames})
+              </span>
             ) : (
-              <span className="text-neutral-600">Ngưỡng: 60%</span>
+              <span className="text-neutral-600">
+                Ngưỡng: {Math.round(sensitivityConfig.confidenceThreshold * 100)}%
+              </span>
             )}
           </div>
         </div>
       </div>
 
       {/* Main Translation Sentence Box */}
-      <div className="w-full bg-neutral-900 border border-neutral-800 rounded-2xl p-4 sm:p-5 space-y-3.5 shadow-xl">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-mono uppercase tracking-wider text-neutral-400">
+      <div className="w-full bg-neutral-900 border border-neutral-800 rounded-2xl p-3.5 sm:p-5 space-y-3 shadow-xl">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <span className="text-xs font-mono uppercase tracking-wider text-neutral-400 font-bold">
             Kết quả ghép câu thời gian thực
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             {sentenceTokens.length > 0 && (
               <>
                 <button
                   onClick={handleSpeak}
                   title="Đọc to câu dịch"
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium rounded-lg transition-colors cursor-pointer"
+                  className="flex items-center gap-1 px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium rounded-lg transition-colors cursor-pointer"
                 >
                   <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
                   <span>Đọc to</span>
@@ -541,11 +757,11 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
 
                 <button
                   onClick={handleClearSentence}
-                  title="Xoá câu hiện tại"
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-neutral-800 hover:bg-rose-950/60 hover:text-rose-400 hover:border-rose-800/40 text-neutral-400 text-xs font-medium rounded-lg border border-transparent transition-colors cursor-pointer"
+                  title="Xoá toàn bộ câu"
+                  className="flex items-center gap-1 px-2.5 py-1.5 bg-neutral-800 hover:bg-rose-950/60 hover:text-rose-400 hover:border-rose-800/40 text-neutral-400 text-xs font-medium rounded-lg border border-transparent transition-colors cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  <span>Xoá câu</span>
+                  <span>Xoá</span>
                 </button>
               </>
             )}
@@ -559,16 +775,23 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
           </span>
 
           {sentenceTokens.length === 0 ? (
-            <span className="text-sm text-neutral-600 italic font-sans">
-              Chưa có ký hiệu nào được chốt. Hãy thực hiện ký hiệu trước camera (ví dụ: TÔI, BÂY_GIỜ, CẢM_THẤY, VUI_VẺ).
+            <span className="text-xs sm:text-sm text-neutral-600 italic font-sans">
+              Chưa có ký hiệu nào được chốt. Hãy giữ cử chỉ tay trước camera (~0.15s) để ghép câu.
             </span>
           ) : (
             sentenceTokens.map((token, idx) => (
               <span
                 key={`${token}-${idx}`}
-                className="text-base sm:text-lg font-bold text-white font-mono bg-neutral-800/80 border border-emerald-500/30 px-3 py-1 rounded-lg shadow-sm tracking-wide"
+                className="group inline-flex items-center gap-1.5 text-sm sm:text-base font-bold text-white font-mono bg-neutral-800/90 border border-emerald-500/30 px-2.5 py-1 rounded-lg shadow-sm tracking-wide transition-all hover:border-emerald-400"
               >
-                {token}
+                <span>{token}</span>
+                <button
+                  onClick={() => handleRemoveToken(idx)}
+                  title="Xoá từ này"
+                  className="text-neutral-500 group-hover:text-rose-400 hover:bg-neutral-700 rounded-full p-0.5 transition-colors cursor-pointer"
+                >
+                  <X className="w-3 h-3" />
+                </button>
               </span>
             ))
           )}
@@ -576,13 +799,13 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
 
         {/* Optional: Gemini AI Sentence Smoother */}
         <div className="pt-2 border-t border-neutral-800/60 flex flex-col space-y-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-emerald-400" />
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
               <span className="text-xs font-medium text-neutral-300">
-                Làm mượt câu tự nhiên (Gemini AI)
+                Làm mượt câu (Gemini AI)
               </span>
-              <span className="text-[10px] text-neutral-500 font-mono">
+              <span className="text-[10px] text-neutral-500 font-mono hidden sm:inline">
                 [Tùy chọn · Giữ nguyên ý gốc]
               </span>
             </div>
@@ -620,7 +843,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
           {/* Smoothed Result Display (parallel to raw tokens) */}
           {isSmootherEnabled && (
             <div className="p-3 bg-neutral-950/60 rounded-xl border border-neutral-800 space-y-1">
-              <span className="text-[11px] font-mono text-neutral-400 uppercase">
+              <span className="text-[10px] font-mono text-neutral-400 uppercase">
                 Câu tiếng Việt tự nhiên:
               </span>
               {isSmoothingLoading ? (
@@ -628,7 +851,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
                   Đang làm mượt câu với Gemini API...
                 </p>
               ) : smoothedText ? (
-                <p className="text-base font-semibold text-emerald-300">
+                <p className="text-sm sm:text-base font-semibold text-emerald-300">
                   {smoothedText}
                 </p>
               ) : (
@@ -646,13 +869,13 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
 
       {/* Quick Test / Gesture Simulator Bar */}
       <div className="w-full bg-neutral-900/50 border border-neutral-800/60 rounded-xl p-3 space-y-2">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-1">
           <span className="text-[11px] font-mono uppercase text-neutral-400 flex items-center gap-1.5">
             <Info className="w-3.5 h-3.5 text-neutral-400" />
-            Kiểm tra nhanh ký hiệu mẫu (Mô phỏng chuỗi câu)
+            Ký hiệu mẫu nhanh (Nhấn để ghép chuỗi tức thì)
           </span>
           <span className="text-[10px] text-neutral-500">
-            Bấm để kiểm tra ghép câu "TÔI BÂY_GIỜ CẢM_THẤY VUI_VẺ"
+            Tối ưu cho chuỗi: TÔI BÂY_GIỜ CẢM_THẤY VUI_VẺ
           </span>
         </div>
         <div className="flex flex-wrap gap-1.5">
@@ -660,7 +883,7 @@ export const LiveTranslate: React.FC<LiveTranslateProps> = ({
             <button
               key={lbl}
               onClick={() => handleSimulateGesture(lbl)}
-              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 hover:text-emerald-400 text-neutral-300 text-xs font-mono font-medium rounded-lg border border-neutral-700/60 transition-colors cursor-pointer"
+              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 hover:text-emerald-400 text-neutral-300 text-xs font-mono font-medium rounded-lg border border-neutral-700/60 transition-colors cursor-pointer active:scale-95"
             >
               + {lbl}
             </button>

@@ -69,16 +69,16 @@ export function computeCosineSimilarity(vecA: number[], vecB: number[]): number 
 
 /**
  * Converts a Euclidean distance on normalized landmarks to a similarity score [0, 1].
- * For normalized hands, a distance under 0.12 is very close (similarity ~0.85-0.98).
- * A distance of 0.4 or higher is very different (similarity -> 0).
+ * For normalized hands, a distance under 0.15 is very close (similarity ~0.88-0.98).
+ * A natural pose usually ranges around 0.12 - 0.26 (similarity ~0.70-0.90).
+ * Highly dissimilar poses (>0.52) drop to 0.
  */
 export function distanceToSimilarity(dist: number): number {
-  // Linear decay with sharp dropoff for dissimilar poses
-  const maxAcceptableDist = 0.45;
+  const maxAcceptableDist = 0.58;
   if (dist >= maxAcceptableDist) return 0;
   const rawScore = 1 - dist / maxAcceptableDist;
-  // Non-linear enhancement so close matches get realistic confidence in 80-98% range
-  return Math.max(0, Math.min(1, Math.pow(rawScore, 0.85)));
+  // Calibrated exponent for natural confidence percentages
+  return Math.max(0, Math.min(1, Math.pow(rawScore, 0.72)));
 }
 
 /**

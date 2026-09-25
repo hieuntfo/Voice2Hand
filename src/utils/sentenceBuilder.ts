@@ -1,22 +1,45 @@
 import { RecognitionResult } from '../types';
-import { CONFIDENCE_THRESHOLD } from './knnClassifier';
 
-export const STABILITY_FRAMES_REQUIRED = 8; // Stable for 8 frames
-export const COOLDOWN_MS = 1000; // 1 second cooldown after commit
-export const REST_FRAMES_REQUIRED = 5; // 5 frames of no hand detected counts as a rest
+export interface AggregatorConfig {
+  stabilityFrames: number;      // e.g. 4 frames (default, was 8)
+  cooldownMs: number;           // e.g. 400ms (default, was 1000ms)
+  restFramesRequired: number;   // e.g. 2 frames (default, was 5)
+  confidenceThreshold: number;  // e.g. 0.52 (default, was 0.60)
+}
+
+export const DEFAULT_AGGREGATOR_CONFIG: AggregatorConfig = {
+  stabilityFrames: 4,          // Super responsive (approx 150ms at 25-30fps)
+  cooldownMs: 420,             // Fast recovery before next sign
+  restFramesRequired: 2,       // Fast hand-rest detection
+  confidenceThreshold: 0.52,   // Accessible threshold
+};
 
 export class SentenceAggregator {
-  private consecutiveLabel: string = '';
-  private consecutiveCount: number = 0;
-  private consecutiveConfidences: number[] = [];
+  private config: AggregatorConfig;
+
+  // Sliding history window for robust detection
+  private recentHistory: Array<{ label: string; confidence: number; timestamp: number }> = [];
+  private maxHistorySize: number = 6;
 
   private lastCommittedLabel: string = '';
   private lastCommitTimestamp: number = 0;
   private noHandFrameCount: number = 0;
   private hasRestedSinceLastCommit: boolean = true;
 
+  constructor(customConfig?: Partial<AggregatorConfig>) {
+    this.config = { ...DEFAULT_AGGREGATOR_CONFIG, ...customConfig };
+  }
+
+  public updateConfig(newConfig: Partial<AggregatorConfig>): void {
+    this.config = { ...this.config, ...newConfig };
+  }
+
+  public getConfig(): AggregatorConfig {
+    return { ...this.config };
+  }
+
   /**
-   * Processes a new frame recognition result.
+   * Processes a new frame recognition result with sliding window aggregation.
    * Returns newly committed token if conditions are met, otherwise null.
    */
   public processFrame(result: RecognitionResult): {
@@ -27,18 +50,16 @@ export class SentenceAggregator {
   } {
     const now = Date.now();
     const timeSinceLastCommit = now - this.lastCommitTimestamp;
-    const isCoolingDown = timeSinceLastCommit < COOLDOWN_MS;
-    const remainingCooldownMs = isCoolingDown ? COOLDOWN_MS - timeSinceLastCommit : 0;
+    const isCoolingDown = timeSinceLastCommit < this.config.cooldownMs;
+    const remainingCooldownMs = isCoolingDown ? this.config.cooldownMs - timeSinceLastCommit : 0;
 
-    // Track rest between hand gestures (no hands detected)
+    // 1. Hand presence tracking & rest detection
     if (result.handCount === 0) {
       this.noHandFrameCount++;
-      if (this.noHandFrameCount >= REST_FRAMES_REQUIRED) {
+      if (this.noHandFrameCount >= this.config.restFramesRequired) {
         this.hasRestedSinceLastCommit = true;
       }
-      this.consecutiveLabel = '';
-      this.consecutiveCount = 0;
-      this.consecutiveConfidences = [];
+      this.recentHistory = [];
       return {
         committedToken: null,
         progress: 0,
@@ -49,11 +70,9 @@ export class SentenceAggregator {
 
     this.noHandFrameCount = 0;
 
-    // If cooldown is still active, don't accumulate confirmation frames yet
+    // 2. Cooldown active: user just committed a sign, waiting for transition
     if (isCoolingDown) {
-      this.consecutiveLabel = '';
-      this.consecutiveCount = 0;
-      this.consecutiveConfidences = [];
+      this.recentHistory = [];
       return {
         committedToken: null,
         progress: 0,
@@ -62,26 +81,29 @@ export class SentenceAggregator {
       };
     }
 
-    // Must be a confident recognized label
-    if (!result.isConfident || !result.label) {
-      this.consecutiveLabel = '';
-      this.consecutiveCount = 0;
-      this.consecutiveConfidences = [];
+    // 3. Must have a valid recognized label with confidence >= threshold
+    if (!result.label || result.confidence < this.config.confidenceThreshold) {
+      // Degrade history gracefully instead of instantly wiping out
+      if (this.recentHistory.length > 0) {
+        this.recentHistory.shift();
+      }
+      const currentCount = this.recentHistory.length;
       return {
         committedToken: null,
-        progress: 0,
+        progress: Math.min(0.9, currentCount / this.config.stabilityFrames),
         isCoolingDown: false,
         remainingCooldownMs: 0,
       };
     }
 
-    // Condition (c) check:
-    // Label must be different from last committed label OR hand has rested between commits
+    // 4. Same-label repetition protection:
+    // Label can be committed if:
+    // (a) It differs from the last committed label, OR
+    // (b) Hands have rested (dropped/left frame) since the last commit
     const canCommitThisLabel =
       result.label !== this.lastCommittedLabel || this.hasRestedSinceLastCommit;
 
     if (!canCommitThisLabel) {
-      // User is holding same sign without resting hand
       return {
         committedToken: null,
         progress: 0,
@@ -90,43 +112,59 @@ export class SentenceAggregator {
       };
     }
 
-    // Check consecutive frames with the same label
-    if (result.label === this.consecutiveLabel) {
-      this.consecutiveCount++;
-      this.consecutiveConfidences.push(result.confidence);
-    } else {
-      this.consecutiveLabel = result.label;
-      this.consecutiveCount = 1;
-      this.consecutiveConfidences = [result.confidence];
+    // 5. Append to sliding history
+    this.recentHistory.push({
+      label: result.label,
+      confidence: result.confidence,
+      timestamp: now,
+    });
+
+    if (this.recentHistory.length > this.maxHistorySize) {
+      this.recentHistory.shift();
     }
 
-    const progress = Math.min(1, this.consecutiveCount / STABILITY_FRAMES_REQUIRED);
-
-    // Condition (a): stable for at least N consecutive frames
-    if (this.consecutiveCount >= STABILITY_FRAMES_REQUIRED) {
-      // Condition (b): average confidence in that window >= threshold
-      const avgConfidence =
-        this.consecutiveConfidences.reduce((a, b) => a + b, 0) /
-        this.consecutiveConfidences.length;
-
-      if (avgConfidence >= CONFIDENCE_THRESHOLD) {
-        const tokenToCommit = this.consecutiveLabel;
-        this.lastCommittedLabel = tokenToCommit;
-        this.lastCommitTimestamp = now;
-        this.hasRestedSinceLastCommit = false;
-
-        // Reset buffer
-        this.consecutiveLabel = '';
-        this.consecutiveCount = 0;
-        this.consecutiveConfidences = [];
-
-        return {
-          committedToken: tokenToCommit,
-          progress: 1,
-          isCoolingDown: true,
-          remainingCooldownMs: COOLDOWN_MS,
-        };
+    // Count occurrences of candidate labels in recent history
+    const counts: Record<string, { count: number; totalConf: number }> = {};
+    for (const item of this.recentHistory) {
+      if (!counts[item.label]) {
+        counts[item.label] = { count: 0, totalConf: 0 };
       }
+      counts[item.label].count++;
+      counts[item.label].totalConf += item.confidence;
+    }
+
+    let dominantLabel = '';
+    let maxCount = 0;
+    let avgConf = 0;
+
+    for (const [lbl, data] of Object.entries(counts)) {
+      if (data.count > maxCount) {
+        maxCount = data.count;
+        dominantLabel = lbl;
+        avgConf = data.totalConf / data.count;
+      }
+    }
+
+    const progress = Math.min(1, maxCount / this.config.stabilityFrames);
+
+    // 6. Verification: has dominant label reached stabilityFrames requirement?
+    if (
+      maxCount >= this.config.stabilityFrames &&
+      avgConf >= this.config.confidenceThreshold &&
+      dominantLabel
+    ) {
+      const tokenToCommit = dominantLabel;
+      this.lastCommittedLabel = tokenToCommit;
+      this.lastCommitTimestamp = now;
+      this.hasRestedSinceLastCommit = false;
+      this.recentHistory = []; // Reset history after commit
+
+      return {
+        committedToken: tokenToCommit,
+        progress: 1,
+        isCoolingDown: true,
+        remainingCooldownMs: this.config.cooldownMs,
+      };
     }
 
     return {
@@ -138,9 +176,7 @@ export class SentenceAggregator {
   }
 
   public reset(): void {
-    this.consecutiveLabel = '';
-    this.consecutiveCount = 0;
-    this.consecutiveConfidences = [];
+    this.recentHistory = [];
     this.lastCommittedLabel = '';
     this.lastCommitTimestamp = 0;
     this.noHandFrameCount = 0;

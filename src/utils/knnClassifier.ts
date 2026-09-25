@@ -5,7 +5,7 @@ import {
   distanceToSimilarity,
 } from './handNormalization';
 
-export const CONFIDENCE_THRESHOLD = 0.60; // 60% confidence threshold as requested
+export const CONFIDENCE_THRESHOLD = 0.52; // 52% default for fast & accessible recognition
 export const DEFAULT_K = 3;
 
 export interface FrameInputData {
@@ -16,31 +16,53 @@ export interface FrameInputData {
 }
 
 /**
+ * Creates horizontally flipped vector (negates relative x coordinate)
+ * to support both left and right hand signing seamlessly.
+ */
+function flipHandX(points: number[]): number[] {
+  const flipped = [...points];
+  for (let i = 0; i < 21; i++) {
+    flipped[i * 3] = -flipped[i * 3]; // Invert dx
+  }
+  return flipped;
+}
+
+/**
  * Calculates similarity between a current observed frame and a stored sign sample.
+ * Evaluates both direct and horizontally mirrored hand for 1-hand gestures
+ * so both left-handed and right-handed signers get instant high confidence.
  */
 export function computeSampleSimilarity(frame: FrameInputData, sample: SignSample): number {
   if (frame.handCount !== sample.handCount) {
-    // If hand counts don't match (e.g. 1 hand observed vs 2-hand sign), heavily penalize
     return 0;
   }
 
   if (frame.handCount === 1) {
     if (!frame.hand1Points || !sample.hand1) return 0;
-    const dist = computeHandVectorDistance(frame.hand1Points, sample.hand1);
-    const cosSim = computeCosineSimilarity(frame.hand1Points, sample.hand1);
-    const distSim = distanceToSimilarity(dist);
-    // Combine Euclidean distance with cosine similarity for fine-grained accuracy
-    return Math.max(0, Math.min(1, 0.65 * distSim + 0.35 * Math.max(0, cosSim)));
+
+    // Test direct orientation
+    const distDirect = computeHandVectorDistance(frame.hand1Points, sample.hand1);
+    const cosDirect = computeCosineSimilarity(frame.hand1Points, sample.hand1);
+    const simDirect = 0.60 * distanceToSimilarity(distDirect) + 0.40 * Math.max(0, cosDirect);
+
+    // Test mirrored (left vs right hand) orientation
+    const flippedPoints = flipHandX(frame.hand1Points);
+    const distFlipped = computeHandVectorDistance(flippedPoints, sample.hand1);
+    const cosFlipped = computeCosineSimilarity(flippedPoints, sample.hand1);
+    const simFlipped = 0.60 * distanceToSimilarity(distFlipped) + 0.40 * Math.max(0, cosFlipped);
+
+    return Math.max(0, Math.min(1, Math.max(simDirect, simFlipped)));
   }
 
   if (frame.handCount === 2) {
     if (!frame.hand1Points || !frame.hand2Points || !sample.hand1 || !sample.hand2) return 0;
 
-    // Evaluate matching in both direct (h1->s1, h2->s2) and swapped (h1->s2, h2->s1) orientation
+    // Direct orientation (h1->s1, h2->s2)
     const dist1 = computeHandVectorDistance(frame.hand1Points, sample.hand1);
     const dist2 = computeHandVectorDistance(frame.hand2Points, sample.hand2);
     const scoreDirect = (distanceToSimilarity(dist1) + distanceToSimilarity(dist2)) / 2;
 
+    // Swapped orientation (h1->s2, h2->s1)
     const distSwapped1 = computeHandVectorDistance(frame.hand1Points, sample.hand2);
     const distSwapped2 = computeHandVectorDistance(frame.hand2Points, sample.hand1);
     const scoreSwapped = (distanceToSimilarity(distSwapped1) + distanceToSimilarity(distSwapped2)) / 2;
@@ -58,12 +80,14 @@ export function computeSampleSimilarity(frame: FrameInputData, sample: SignSampl
  * @param dataset The full or profile-filtered list of SignSamples
  * @param activeProfile 'global' for Global Model, or profile name (e.g. 'khang')
  * @param k Number of nearest neighbors to aggregate (default 3)
+ * @param threshold Confidence threshold to consider confident
  */
 export function classifyHandGesture(
   frame: FrameInputData,
   dataset: SignSample[],
   activeProfile: string = 'global',
-  k: number = DEFAULT_K
+  k: number = DEFAULT_K,
+  threshold: number = CONFIDENCE_THRESHOLD
 ): RecognitionResult {
   // If no hands detected
   if (frame.handCount === 0 || !frame.hand1Points) {
@@ -135,7 +159,7 @@ export function classifyHandGesture(
     }
   }
 
-  const isConfident = bestConfidence >= CONFIDENCE_THRESHOLD && Boolean(bestLabel);
+  const isConfident = bestConfidence >= threshold && Boolean(bestLabel);
   const percent = Math.round(bestConfidence * 100);
 
   let statusText = '';
